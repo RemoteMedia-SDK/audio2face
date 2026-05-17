@@ -1,0 +1,27 @@
+# Audio2FaceLipSyncNode as a standalone Path 3 cdylib plugin.
+#
+# Coordinates the NVIDIA Audio2Face bundle (network.onnx +
+# bs_skin_<Identity>.npz + model_data_<Identity>.npz) into a streaming
+# lip-sync node: consumes RuntimeData::Audio at 16 kHz in 1-second
+# windows, runs ONNX inference, solves vertex deltas to 39-D
+# blendshape weights with PGD or BVLS, expands to 52-D ARKit, and
+# emits one RuntimeData::Json {kind: "blendshapes", ...} per ~33 ms
+# output frame.
+#
+# Consumer manifest reference:
+#
+#   "plugins": ["audio2face@v0.1.0"]
+#       (canonical-org shorthand → github.com/RemoteMedia-SDK/audio2face)
+#
+#   "plugins": ["./plugins/libaudio2face_plugin.so"]
+#       (local path)
+
+[plugin]
+name        = "audio2face"
+version     = "0.1.0"
+language    = "rust"
+description = "NVIDIA Audio2Face-style lipsync (blendshape weights from audio) — standalone Rust cdylib plugin"
+
+[rust]
+node_types    = ["Audio2FaceLipSyncNode"]
+asset_pattern = "lib{name}-{arch}-{os}.{ext}"
