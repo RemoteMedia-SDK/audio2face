@@ -20,7 +20,19 @@ incremental = true
 
 [lib]
 name = "audio2face_plugin"
-crate-type = ["cdylib"]
+# cdylib: matrix-built `.so` artifact for dlopen-based loading.
+# rlib: lets consumers (e.g. examples/qwen-s2s-avatar-plugins) link
+#       this crate as a normal Rust dep and register its factory
+#       in-process via `wrap_ffi_factory(...)` — no dlopen, no
+#       msgpack roundtrip, identical behavior.
+crate-type = ["cdylib", "rlib"]
+
+# `plugin-export` (default on) gates the `abi_stable` root-module
+# symbol for dlopen. Disable when linking multiple plugins as rlibs
+# in one binary (symbol collision).
+[features]
+default = ["plugin-export"]
+plugin-export = []
 
 # Path-3 hand-rolled plugin: depends ONLY on the skinny
 # `remotemedia-plugin-sdk` umbrella. Does NOT link `remotemedia-core` —

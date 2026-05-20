@@ -663,8 +663,19 @@ impl FfiNodeFactory for Audio2FaceLipSyncNodeFactory {
     }
 
     fn create(&self, params: RString) -> RResult<FfiNodeBox, RString> {
+        // Accepts both snake_case and camelCase manifest keys via
+        // plugin-sdk's lenient deserializer. Surface parse errors
+        // explicitly — silently falling back to defaults would leave
+        // bundlePath empty and surface only as ENOENT at load time.
         let cfg: Audio2FaceLipSyncConfig =
-            serde_json::from_str(params.as_str()).unwrap_or_default();
+            match remotemedia_plugin_sdk::params::deserialize_params(params.as_str()) {
+                Ok(c) => c,
+                Err(e) => {
+                    return remotemedia_plugin_sdk::abi_stable::std_types::RErr(RString::from(
+                        format!("Audio2FaceLipSyncNode params parse failed: {e}"),
+                    ));
+                }
+            };
         let node = match Audio2FaceLipSyncNode::load(cfg) {
             Ok(n) => n,
             Err(e) => {
@@ -680,4 +691,8 @@ impl FfiNodeFactory for Audio2FaceLipSyncNodeFactory {
     }
 }
 
+// Emits the abi_stable root-module symbol for dlopen. Gated behind
+// the `plugin-export` cargo feature so the rlib can be linked
+// alongside other plugins without duplicate-symbol collisions.
+#[cfg(feature = "plugin-export")]
 remotemedia_plugin_sdk::plugin_export!(Audio2FaceLipSyncNodeFactory);
