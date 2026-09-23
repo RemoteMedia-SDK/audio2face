@@ -161,6 +161,7 @@ pub struct Audio2FaceLipSyncNode {
     /// inference call (i.e. multiples of 1000). The pts_ms of frame `f`
     /// emitted from a window is `cum_window_ms + f * 1000 / 30`.
     cum_window_ms: Arc<AtomicU64>,
+    speech_epoch: Arc<AtomicU64>,
     /// Real-time pacing anchor. `(wallclock_when_first_emitted, first_pts_ms)`.
     pace_anchor: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
 }
@@ -215,6 +216,7 @@ impl Audio2FaceLipSyncNode {
             data: Arc::new(data),
             audio_buffer: Arc::new(Mutex::new(Vec::with_capacity(AUDIO_BUFFER_LEN * 2))),
             cum_window_ms: Arc::new(AtomicU64::new(0)),
+            speech_epoch: Arc::new(AtomicU64::new(0)),
             pace_anchor: Arc::new(Mutex::new(None)),
         })
     }
@@ -222,6 +224,7 @@ impl Audio2FaceLipSyncNode {
     /// Drop all in-flight state: GRU, solver temporal pull, smoother,
     /// and the audio accumulator. Idempotent. Used by `barge_in`.
     pub fn barge(&self) {
+        self.speech_epoch.fetch_add(1, Ordering::AcqRel);
         self.inference.lock().reset_state();
         self.solver.lock().reset_temporal();
         self.smoother.lock().reset();
@@ -384,6 +387,16 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
     where
         F: FnMut(RuntimeData) -> Result<()> + Send,
     {
+        let data = match data {
+            RuntimeData::Text(ref text) => {
+                let (_, body) = remotemedia_plugin_sdk::types::split_text_str(text);
+                match serde_json::from_str::<serde_json::Value>(body) {
+                    Ok(value) if value["kind"] == "speech_end" => RuntimeData::Json(value),
+                    _ => data,
+                }
+            }
+            other => other,
+        };
         // Barge envelope: {kind: "barge_in"}. Clears state and emits nothing.
         if let RuntimeData::Json(v) = &data {
             if v.get("kind").and_then(|k| k.as_str()) == Some("barge_in") {
@@ -391,6 +404,39 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
                 return Ok(0);
             }
         }
+
+        let epoch = self.speech_epoch.load(Ordering::Acquire);
+        let flush = matches!(&data, RuntimeData::Json(v) if v["kind"] == "speech_end");
+        if flush
+            && matches!(&data, RuntimeData::Json(v) if v["speech_epoch"].as_u64().is_some_and(|old| old < epoch))
+        {
+            return Ok(0);
+        }
+        let tail_len = if flush {
+            self.audio_buffer.lock().len()
+        } else {
+            0
+        };
+        let tail_end_ms =
+            self.cum_window_ms.load(Ordering::Acquire) + tail_len as u64 * 1000 / 16000;
+        let end_marker = if flush { Some(data.clone()) } else { None };
+        let data = if flush {
+            if tail_len == 0 {
+                callback(data)?;
+                return Ok(1);
+            }
+            RuntimeData::Audio {
+                samples: AudioSamples::Vec(vec![0.0; AUDIO_BUFFER_LEN - tail_len]),
+                sample_rate: 16000,
+                channels: 1,
+                stream_id: None,
+                timestamp_us: None,
+                arrival_ts_us: None,
+                metadata: None,
+            }
+        } else {
+            data
+        };
 
         let (
             samples,
@@ -435,6 +481,15 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
             }
         };
 
+        if metadata
+            .as_ref()
+            .and_then(|m| m.get("speech_epoch"))
+            .and_then(|v| v.as_u64())
+            .is_some_and(|input_epoch| input_epoch < epoch)
+        {
+            return Ok(0);
+        }
+
         // PASSTHROUGH: emit the input Audio so downstream consumers
         // (RenderReadyGateNode → CcRenderNode) see the same audio
         // stream the lip-sync inference is running on.
@@ -452,15 +507,17 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
             pts_ms = pt_pts_ms,
             samples = samples.len() as u64,
         );
-        callback(RuntimeData::Audio {
-            samples: samples.clone(),
-            sample_rate,
-            channels,
-            stream_id,
-            timestamp_us,
-            arrival_ts_us,
-            metadata,
-        })?;
+        if !flush {
+            callback(RuntimeData::Audio {
+                samples: samples.clone(),
+                sample_rate,
+                channels,
+                stream_id,
+                timestamp_us,
+                arrival_ts_us,
+                metadata,
+            })?;
+        }
 
         if sample_rate != 16_000 {
             return Err(Error::InvalidData(format!(
@@ -504,7 +561,7 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
             ws
         };
 
-        let mut emitted = 1; // +1 for the audio passthrough above
+        let mut emitted = usize::from(!flush);
         for window in windows {
             let window_start_ms = self.cum_window_ms.fetch_add(STRIDE_MS, Ordering::AcqRel);
             // Move ONNX inference + the PGD/BVLS solver onto tokio's
@@ -536,7 +593,18 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
                     "Audio2FaceLipSyncNode inference task panicked: {e}"
                 ))
             })??;
-            for out in outputs {
+            if self.speech_epoch.load(Ordering::Acquire) != epoch {
+                return Ok(emitted);
+            }
+            for mut out in outputs {
+                if flush
+                    && matches!(&out, RuntimeData::Json(v) if v["pts_ms"].as_u64().is_some_and(|pts| pts >= tail_end_ms))
+                {
+                    continue;
+                }
+                if let RuntimeData::Json(v) = &mut out {
+                    v["speech_epoch"] = epoch.into();
+                }
                 // Pace per-envelope by pts_ms so downstream latest-wins
                 // consumers (e.g. CcRenderNode's pose watch channel) see
                 // every blendshape frame instead of just the LAST one
@@ -618,9 +686,17 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
                         max_w = max_w,
                     );
                 }
+                if self.speech_epoch.load(Ordering::Acquire) != epoch {
+                    return Ok(emitted);
+                }
                 callback(out)?;
                 emitted += 1;
             }
+        }
+        if let Some(marker) = end_marker {
+            self.cum_window_ms.store(tail_end_ms, Ordering::Release);
+            callback(marker)?;
+            emitted += 1;
         }
         Ok(emitted)
     }
@@ -648,6 +724,48 @@ impl AsyncStreamingNode for Audio2FaceLipSyncNode {
 #[allow(dead_code)]
 fn _audio_samples_as_slice_witness(s: &AudioSamples) -> &[f32] {
     s.as_slice()
+}
+
+#[cfg(test)]
+mod speech_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires AUDIO2FACE_TEST_BUNDLE and a deployment GPU"]
+    async fn partial_tail_and_cancelled_epoch_preserve_audio_duration() {
+        let node = Audio2FaceLipSyncNode::load(Audio2FaceLipSyncConfig {
+            bundle_path: std::env::var("AUDIO2FACE_TEST_BUNDLE").unwrap().into(),
+            use_gpu: true,
+            pace_realtime: false,
+            ..Default::default()
+        }).unwrap();
+        let input = RuntimeData::Audio {
+            samples: AudioSamples::Vec(vec![0.0; 4400]),
+            sample_rate: 16000, channels: 1, stream_id: None,
+            timestamp_us: None, arrival_ts_us: None,
+            metadata: Some(serde_json::json!({"speech_epoch":0, "pts_us":0})),
+        };
+        let marker = RuntimeData::Json(serde_json::json!({
+            "kind":"speech_end", "speech_epoch":0, "pts_us":275000
+        }));
+        let mut outputs = Vec::new();
+        for data in [input.clone(), marker.clone()] {
+            node.process_streaming(data, None, |out| { outputs.push(out); Ok(()) }).await.unwrap();
+        }
+        assert_eq!(outputs.iter().filter_map(|out| match out {
+            RuntimeData::Audio { samples, .. } => Some(samples.len()), _ => None,
+        }).sum::<usize>(), 4400, "inference padding must never become audible");
+        let faces: Vec<_> = outputs.iter().filter_map(|out| match out {
+            RuntimeData::Json(v) if v.get("arkit_52").is_some() => Some(v), _ => None,
+        }).collect();
+        assert!(!faces.is_empty(), "partial windows must still animate speech");
+        assert!(faces.iter().all(|v| v["pts_ms"].as_u64().unwrap() < 275));
+        assert!(matches!(outputs.last(), Some(RuntimeData::Json(v)) if v["kind"] == "speech_end"));
+        node.barge();
+        for stale in [input, marker] {
+            assert_eq!(node.process_streaming(stale, None, |_| panic!("stale speech leaked after cancellation")).await.unwrap(), 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
